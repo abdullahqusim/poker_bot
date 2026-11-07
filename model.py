@@ -10,13 +10,13 @@ REALISE_OOP = 0.88
 
 # Player types, as what they do how often. A new opponent is scored against
 # each row, so a few hands say which rates to expect before the counts can.
-#            opens  folds  post_bets  pre_raises  bluffs
+#            opens  folds  post_bets  pre_raises  bluffs  post_raises
 ARCHETYPES = (
-    (0.25, 0.65, 0.15, 0.06, 0.08),  # nit
-    (0.50, 0.50, 0.30, 0.12, 0.15),  # solid
-    (0.75, 0.35, 0.45, 0.22, 0.30),  # aggressive
-    (0.97, 0.12, 0.70, 0.50, 0.55),  # maniac
-    (0.50, 0.15, 0.15, 0.06, 0.10),  # calling station
+    (0.25, 0.65, 0.15, 0.06, 0.08, 0.05),  # nit
+    (0.50, 0.50, 0.30, 0.12, 0.15, 0.10),  # solid
+    (0.75, 0.35, 0.45, 0.22, 0.30, 0.20),  # aggressive
+    (0.97, 0.12, 0.70, 0.50, 0.55, 0.40),  # maniac
+    (0.50, 0.15, 0.15, 0.06, 0.10, 0.05),  # calling station
 )
 # The counters behind each column, and how many hands of weight its prior has.
 COLUMNS = (
@@ -25,9 +25,11 @@ COLUMNS = (
     ("post_bets", "post_actions", 10),
     ("pre_raises", "pre_faced", 5),
     ("bluffs", "shown", 8),
+    ("post_raises", "post_faced", 10),
 )
-NEUTRAL = (0.5, 0.4, 0.4, 0.2, 0.25)  # the prior with no matrix
+NEUTRAL = (0.5, 0.4, 0.4, 0.2, 0.25, 0.12)  # the prior with no matrix
 TYPE_CONFIDENCE = 0.5  # the rows are rough: count evidence at half weight
+RERAISED_EQUITY = 0.8  # our equity once re-raised, as a share of before
 
 # Whole strategies, as fold equity trusted, realise bonus and raise margin.
 PROFILES = (
@@ -290,9 +292,26 @@ class Model:
         added = min(added, gs.call_amount + extra)
         size = extra / max(1, gs.pot + gs.call_amount)
         fold = self._fold_equity(gs, opponents, size)
+        reraise = min(1 - fold, self._reraise_chance(gs, opponents, total, behind))
         # Who calls a raise is stronger than who was there before it.
         called = equity * (1 - 0.12 * min(1.5, size) - 0.1 * (gs.call_amount > 0))
-        return fold * gs.pot + (1 - fold) * (called * (gs.pot + added + extra) - added)
+        return (fold * gs.pot
+                + reraise * self._reraised_value(gs, equity, added, behind)
+                + (1 - fold - reraise) * (called * (gs.pot + added + extra) - added))
+
+    def _reraise_chance(self, gs, opponents, total, behind):
+        if total >= behind or gs.street != "preflop":
+            return 0.0  # all-in, or after the flop, where pricing it plays too scared
+        return max(self._rate(self._stats(gs.teams[p]), 3) for p in opponents)
+
+    def _reraised_value(self, gs, equity, added, behind):
+        """Chips from now if we are re-raised: fold and lose what we added,
+        or get it all in, whichever is better."""
+        me = self.player_id
+        effective = min(gs.stacks[me] + gs.bets[me], behind)
+        dead = gs.pot - sum(gs.bets)
+        all_in = RERAISED_EQUITY * equity * (dead + 2 * effective) - (effective - gs.bets[me])
+        return max(-added, all_in)
 
     def _fold_equity(self, gs, opponents, size):
         fold = 1.0
@@ -311,10 +330,12 @@ class Model:
         # faced: times they faced a bet; folds: of those, how many they folded
         # post_actions, post_bets: their moves after the flop, and the raises
         # pre_faced, pre_raises: preflop raises they faced, and re-raised
+        # post_faced, post_raises: the same after the flop
         # shown, bluffs: showdowns after they bet, and how many of those were air
         # actions, raises: all their moves, and the raises among them
         return {"hands": 0, "opens": 0, "faced": 0, "folds": 0,
                 "post_actions": 0, "post_bets": 0, "pre_faced": 0, "pre_raises": 0,
+                "post_faced": 0, "post_raises": 0,
                 "shown": 0, "bluffs": 0}
 
     def _stats(self, team):
@@ -361,6 +382,9 @@ class Model:
         else:
             s["post_actions"] += 1
             s["post_bets"] += a.kind == "raise"
+            if self.facing_bet:
+                s["post_faced"] += 1
+                s["post_raises"] += a.kind == "raise"
             if a.kind == "raise":
                 self.aggression[p] = self.aggression.get(p, 0) + 1
 
