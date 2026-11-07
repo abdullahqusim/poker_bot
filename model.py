@@ -1,43 +1,6 @@
-import math
-
 from card_utils import Card
 from game_state import GameStateView
 from player_action import DEALER, PlayerAction
-
-SAMPLES = 600  # Monte Carlo deals per decision (a few ms heads-up)
-REALISE_PREFLOP_OOP = 0.8
-REALISE_OOP = 0.88
-
-# Player types, as what they do how often. A new opponent is scored against
-# each row, so a few hands say which rates to expect before the counts can.
-#            opens  folds  post_bets  pre_raises  bluffs  post_raises
-ARCHETYPES = (
-    (0.25, 0.65, 0.15, 0.06, 0.08, 0.05),  # nit
-    (0.50, 0.50, 0.30, 0.12, 0.15, 0.10),  # solid
-    (0.75, 0.35, 0.45, 0.22, 0.30, 0.20),  # aggressive
-    (0.97, 0.12, 0.70, 0.50, 0.55, 0.40),  # maniac
-    (0.50, 0.15, 0.15, 0.06, 0.10, 0.05),  # calling station
-)
-# The counters behind each column, and how many hands of weight its prior has.
-COLUMNS = (
-    ("opens", "hands", 8),
-    ("folds", "faced", 10),
-    ("post_bets", "post_actions", 10),
-    ("pre_raises", "pre_faced", 5),
-    ("bluffs", "shown", 8),
-    ("post_raises", "post_faced", 10),
-)
-NEUTRAL = (0.5, 0.4, 0.4, 0.2, 0.25, 0.12)  # the prior with no matrix
-TYPE_CONFIDENCE = 0.5  # the rows are rough: count evidence at half weight
-RERAISED_EQUITY = 0.8  # our equity once re-raised, as a share of before
-
-# Whole strategies, as fold equity trusted, realise bonus and raise margin.
-PROFILES = (
-    (1.0, 0.0, 0.01),    # the default
-    (0.7, -0.06, 0.03),  # tighter, fewer bluffs
-    (1.4, 0.0, 0.0),     # pressure
-    (0.85, 0.07, 0.02),  # sticky, calls down
-)
 
 # The 169 starting hands, best first, by equity against a random hand.
 HAND_ORDER = (
@@ -169,183 +132,76 @@ class _Rng:
 
 
 class Model:
-    USE_MATRIX = True
-    USE_PROFILES = True
+    """Plans for 25 big blinds heads-up: never limps, bets small and often on
+    the flop, sizes value bets to get the stacks in by the river, and has a
+    floor on how much it folds."""
 
     def __init__(self):
         self.hand = []
         self.player_id = None
-        self.rng = _Rng()
-        # Per team name: see _new_stats.
-        self.opp_stats = {}
-        # This hand, per seat.
-        self.range_top = {}  # the share of starting hands they still hold
-        self.aggression = {}  # bets and raises after the flop
-        self.acted_preflop = set()
-        self.facing_bet = False
-        self.board_seen = 0  # board cards replayed so far
-        self.shown = {}  # hole cards revealed at the showdown
-        self.scores = {}  # team -> per profile, [hands, big blinds won]
-        self.fold_trust = 1.0  # this hand's profile: fold equity trusted
-        self.profile = None  # this hand's, once chosen
-        self.start = None  # my chips when this hand began
-
-    # ---- engine hooks ----------------------------------------------------
+        self.rng = _Rng(2024)
+        self.opp = {}  # team -> counters, see _counters
+        self.top = 1.0  # share of starting hands the opponent still holds
+        self.bets = 0  # their bets after the flop, this hand
+        self.facing = False  # a raise is open on this street
+        self.raised_last = False  # the last raise of the hand was ours
+        self.mine = False  # the open raise on this street is ours
+        self.seen = 0  # board cards replayed
+        self.shown = {}
+        self.first_pre = True  # they have not moved before the flop yet
 
     def seed(self, hand: list[Card], player_id: int):
         self.hand = hand
         self.player_id = player_id
-        self.range_top = {}
-        self.aggression = {}
-        self.acted_preflop = set()
-        self.facing_bet = False
-        self.board_seen = 0
+        self.top = 1.0
+        self.bets = 0
+        self.facing = False
+        self.raised_last = False
+        self.mine = False
+        self.seen = 0
         self.shown = {}
-        self.profile = None
-        self.start = None
+        self.first_pre = True
 
     def run(self, actions: list[PlayerAction], game_state: GameStateView) -> PlayerAction:
         try:
-            return self._decide(actions, game_state)
+            self._observe(actions, game_state)
+            if game_state.street == "preflop":
+                return self._preflop(game_state)
+            return self._postflop(game_state)
         except Exception:  # a safe move beats a fault
             if game_state.call_amount == 0:
                 return PlayerAction.call(self.player_id)
             return PlayerAction.fold(self.player_id)
 
-    def _decide(self, actions, game_state):
-        self._observe(actions, game_state)
-        gs = game_state
-        if self.start is None:
-            self.start = gs.stacks[self.player_id] + gs.bets[self.player_id]
-            self.profile = self._choose_profile(gs) if self.USE_PROFILES else 0
-        self.fold_trust, bonus, margin = PROFILES[self.profile]
-        equity = self._equity(gs)
-        pot, call = gs.pot, gs.call_amount
-        realise = min(1.0, self._realise(gs) + bonus)
-        best = PlayerAction.call(self.player_id)
-        if call == 0:
-            best_ev = equity * pot * realise
-        else:
-            best_ev = equity * (pot + call) * realise - call
-            if best_ev < 0:
-                best, best_ev = PlayerAction.fold(self.player_id), 0.0
-        if gs.can_raise:
-            for total in self._raise_sizes(gs):
-                ev = self._raise_ev(gs, equity * realise, total)
-                if ev > best_ev + margin * pot:  # must clearly beat the passive line
-                    best, best_ev = PlayerAction.raise_to(self.player_id, total), ev
-        return best
-
     def end_game(self, actions: list[PlayerAction], game_state: GameStateView):
         self._observe(actions, game_state)
-        self._learn_from_showdown(game_state)
-        if self.profile is not None and self.USE_PROFILES:
-            arm = self.scores[self._rival(game_state)][self.profile]
-            arm[0] += 1
-            arm[1] += (game_state.stacks[self.player_id] - self.start) / game_state.big_blind
+        board = {c.rank for c in game_state.board}
+        for p, cards in self.shown.items():
+            if p != self.player_id and self.bets:
+                c = self._counters(game_state.teams[p])
+                c["shown"] += 1
+                c["air"] += cards[0].rank != cards[1].rank and not board & {x.rank for x in cards}
 
-    # ---- which strategy --------------------------------------------------
-
-    def _rival(self, gs):
-        return next(gs.teams[p] for p in range(gs.num_players) if p != self.player_id)
-
-    def _choose_profile(self, gs):
-        """The usual upper confidence bound. Hands swing by about 10 big
-        blinds, which sets how long a profile needs to prove itself."""
-        arms = self.scores.setdefault(self._rival(gs), [[0, 0.0] for _ in PROFILES])
-        total = sum(n for n, _ in arms) + 1
-        best, best_value = 0, -math.inf
-        for i, (n, won) in enumerate(arms):
-            value = math.inf if n == 0 else won / n + 10 * math.sqrt(2 * math.log(total) / n)
-            if value > best_value:
-                best, best_value = i, value
-        return best
-
-    # ---- betting ---------------------------------------------------------
-
-    def _realise(self, gs):
-        """Share of equity kept: less with streets to come, and less out of
-        position (heads-up the button acts last from the flop on)."""
-        if gs.street == "river" or len(gs.active_players) <= 1:
-            return 1.0  # no more betting: every card comes for free
-        if gs.button == self.player_id:
-            return 0.97
-        return REALISE_PREFLOP_OOP if gs.street == "preflop" else REALISE_OOP
-
-    def _raise_sizes(self, gs):
-        low, high = gs.raise_range
-        pot_after_call = gs.pot + gs.call_amount
-        if gs.street == "preflop":
-            base = gs.current_bet
-            bb = gs.big_blind
-            totals = [int(2.5 * bb), 3 * bb, high] if base == bb else [3 * base, high]
-        else:
-            totals = [gs.current_bet + int(f * pot_after_call) for f in (0.5, 0.75, 1.1)] + [high]
-        return sorted({min(high, max(low, t)) for t in totals})
-
-    def _raise_ev(self, gs, equity, total):
-        me = self.player_id
-        added = total - gs.bets[me]
-        opponents = [p for p in gs.players_in_hand if p != me]
-        behind = max(gs.stacks[p] + gs.bets[p] for p in opponents)
-        extra = max(0, min(total, behind) - gs.current_bet)  # what they add to call
-        added = min(added, gs.call_amount + extra)
-        size = extra / max(1, gs.pot + gs.call_amount)
-        fold = self._fold_equity(gs, opponents, size)
-        reraise = min(1 - fold, self._reraise_chance(gs, opponents, total, behind))
-        # Who calls a raise is stronger than who was there before it.
-        called = equity * (1 - 0.12 * min(1.5, size) - 0.1 * (gs.call_amount > 0))
-        return (fold * gs.pot
-                + reraise * self._reraised_value(gs, equity, added, behind)
-                + (1 - fold - reraise) * (called * (gs.pot + added + extra) - added))
-
-    def _reraise_chance(self, gs, opponents, total, behind):
-        if total >= behind or gs.street != "preflop":
-            return 0.0  # all-in, or after the flop, where pricing it plays too scared
-        return max(self._rate(self._stats(gs.teams[p]), 3) for p in opponents)
-
-    def _reraised_value(self, gs, equity, added, behind):
-        """Chips from now if we are re-raised: fold and lose what we added,
-        or get it all in, whichever is better."""
-        me = self.player_id
-        effective = min(gs.stacks[me] + gs.bets[me], behind)
-        dead = gs.pot - sum(gs.bets)
-        all_in = RERAISED_EQUITY * equity * (dead + 2 * effective) - (effective - gs.bets[me])
-        return max(-added, all_in)
-
-    def _fold_equity(self, gs, opponents, size):
-        fold = 1.0
-        for p in opponents:
-            rate = self._rate(self._stats(gs.teams[p]), 1)
-            if gs.bets[p] == gs.current_bet and gs.current_bet > gs.big_blind:
-                rate *= 0.6  # they just bet: raising them is harder
-            fold *= min(0.95, rate * (0.7 + 0.6 * min(1.0, size)))
-        return min(0.97, fold * self.fold_trust * (0.85 + 0.3 * self.rng.random()))
-
-    # ---- what the opponents have shown -----------------------------------
+    # ---- what they do ----------------------------------------------------
 
     @staticmethod
-    def _new_stats():
-        # hands: hands seen before the flop; opens: of those, first move a raise
-        # faced: times they faced a bet; folds: of those, how many they folded
-        # post_actions, post_bets: their moves after the flop, and the raises
-        # pre_faced, pre_raises: preflop raises they faced, and re-raised
-        # post_faced, post_raises: the same after the flop
-        # shown, bluffs: showdowns after they bet, and how many of those were air
-        # actions, raises: all their moves, and the raises among them
-        return {"hands": 0, "opens": 0, "faced": 0, "folds": 0,
-                "post_actions": 0, "post_bets": 0, "pre_faced": 0, "pre_raises": 0,
-                "post_faced": 0, "post_raises": 0,
-                "shown": 0, "bluffs": 0}
+    def _rate(c, hits, tries, prior, weight):
+        return (c[hits] + prior * weight) / (c[tries] + weight)
 
-    def _stats(self, team):
-        return self.opp_stats.setdefault(team, self._new_stats())
+    def _counters(self, team):
+        return self.opp.setdefault(team, {
+            "pre": 0, "opens": 0,            # their first move, raises among them
+            "vs_raise": 0, "pre_folds": 0, "reraises": 0,  # facing our preflop raise
+            "vs_bet": 0, "post_folds": 0, "post_raises": 0,  # facing our bet
+            "moves": 0, "bets": 0,           # after the flop
+            "shown": 0, "air": 0,            # showdowns after betting, and bluffs
+        })
 
     def _observe(self, actions, gs):
         for a in actions:
             if a.player_id == DEALER:
-                self.facing_bet = False
-                self.board_seen += 1
+                self.seen += 1
+                self.facing = self.mine = False
                 continue
             if a.kind == "reveal_card":
                 self.shown.setdefault(a.player_id, []).append(a.card)
@@ -355,128 +211,161 @@ class Model:
             if a.player_id != self.player_id:
                 self._note(a, gs)
             if a.kind == "raise":
-                self.facing_bet = True
+                self.facing = True
+                self.mine = a.player_id == self.player_id
+                self.raised_last = self.mine
 
     def _note(self, a, gs):
-        p = a.player_id
-        s = self._stats(gs.teams[p])
-        if self.facing_bet:
-            s["faced"] += 1
-            s["folds"] += a.kind == "fold"
-        top = self.range_top.get(p, 1.0)
-        if self.board_seen == 0:  # gs is already past these actions
-            if p not in self.acted_preflop:
-                self.acted_preflop.add(p)
-                s["hands"] += 1
-                s["opens"] += a.kind == "raise"
-            if self.facing_bet:
-                s["pre_faced"] += 1
-                s["pre_raises"] += a.kind == "raise"
-            if a.kind == "raise" and self.facing_bet:
-                top = min(top, self._rate(s, 3))
-            elif a.kind == "raise":
-                top = min(top, self._rate(s, 0))
-            elif a.kind == "call" and self.facing_bet:
-                top = min(top, 1 - self._rate(s, 1))
-            self.range_top[p] = max(0.03, top)
-        else:
-            s["post_actions"] += 1
-            s["post_bets"] += a.kind == "raise"
-            if self.facing_bet:
-                s["post_faced"] += 1
-                s["post_raises"] += a.kind == "raise"
-            if a.kind == "raise":
-                self.aggression[p] = self.aggression.get(p, 0) + 1
+        c = self._counters(gs.teams[a.player_id])
+        raised = a.kind == "raise"
+        if self.seen == 0:
+            if self.first_pre:
+                self.first_pre = False
+                c["pre"] += 1
+                c["opens"] += raised and not self.facing
+            if self.facing:
+                c["vs_raise"] += 1
+                c["pre_folds"] += a.kind == "fold"
+                c["reraises"] += raised
+            if raised and self.facing:
+                self.top = min(self.top, self._rate(c, "reraises", "vs_raise", 0.15, 6) + 0.03)
+            elif raised:
+                self.top = min(self.top, self._rate(c, "opens", "pre", 0.7, 6))
+            elif a.kind == "call" and self.facing:
+                self.top = min(self.top, 1 - self._rate(c, "pre_folds", "vs_raise", 0.3, 6))
+            return
+        c["moves"] += 1
+        c["bets"] += raised
+        if self.bets is not None and raised:
+            self.bets += 1
+        if self.facing:
+            c["vs_bet"] += 1
+            c["post_folds"] += a.kind == "fold"
+            c["post_raises"] += raised
 
-    def _learn_from_showdown(self, gs):
-        board = {c.rank for c in gs.board}
-        for p, cards in self.shown.items():
-            if p == self.player_id or not self.aggression.get(p):
-                continue
-            s = self._stats(gs.teams[p])
-            s["shown"] += 1
-            # Air: no pocket pair, and neither card pairs the board.
-            s["bluffs"] += cards[0].rank != cards[1].rank and not board & {c.rank for c in cards}
+    # ---- equity against what they can hold --------------------------------
 
-    def _bluff_share(self, s):
-        """Chance a hand outside their betting range bets anyway."""
-        return max(0.08, min(0.6, self._rate(s, 4)))
-
-    def _prior(self, s):
-        """What to expect of them: the rows of ARCHETYPES, weighted by how
-        well each explains what they have done so far."""
-        if not self.USE_MATRIX:
-            return NEUTRAL
-        logs = []
-        for row in ARCHETYPES:
-            total = 0.0
-            for rate, (hits, tries, _) in zip(row, COLUMNS):
-                total += s[hits] * math.log(rate) + (s[tries] - s[hits]) * math.log(1 - rate)
-            logs.append(TYPE_CONFIDENCE * total)
-        top = max(logs)
-        weights = [math.exp(x - top) for x in logs]
-        return [sum(w * row[i] for w, row in zip(weights, ARCHETYPES)) / sum(weights)
-                for i in range(len(COLUMNS))]
-
-    def _rate(self, s, column):
-        """How often they do what this column of ARCHETYPES counts: what they
-        have done so far, starting from the prior."""
-        hits, tries, weight = COLUMNS[column]
-        return (s[hits] + weight * self._prior(s)[column]) / (s[tries] + weight)
-
-    # ---- equity ----------------------------------------------------------
-
-    def _candidates(self, gs, p, unseen, board):
-        """The hands p may hold, as (a, b) pairs: inside their estimated
-        starting range, and if they bet after the flop, mostly the best of
-        those: someone who bets a share f of the time bets about their top
-        f. A few others stay in as bluffs: a range is an estimate, not a fact."""
-        rng = self.rng
-        top = self.range_top.get(p, 1.0)
-        hands = []
-        for i, a in enumerate(unseen):
-            for b in unseen[i + 1:]:
-                if _percentile(a, b) <= top or rng.random() < 0.05:
-                    hands.append((a, b))
-        bets = self.aggression.get(p, 0)
-        if not bets or not board or len(hands) < 2:
-            return hands
-        s = self._stats(gs.teams[p])
-        share = self._rate(s, 2) ** bets
-        hands.sort(key=lambda h: _score([h[0], h[1]] + board), reverse=True)
-        keep = max(1, int(len(hands) * share))
-        return hands[:keep] + [h for h in hands[keep:]
-                                  if rng.random() < self._bluff_share(s) ** bets]
-
-    def _equity(self, gs):
-        """Share of the pot won against hands drawn from each opponent's
-        estimated range, not against random hands."""
+    def _equity(self, gs, samples=500):
         rng = self.rng
         hand = [_to_int(c) for c in self.hand]
         board = [_to_int(c) for c in gs.board]
         known = set(hand + board)
         unseen = [c for c in range(52) if c not in known]
+        c = self._counters(self._rival(gs))
+        hands = []
+        for i, a in enumerate(unseen):
+            for b in unseen[i + 1:]:
+                if _percentile(a, b) <= self.top or rng.random() < 0.04:
+                    hands.append((a, b))
+        if self.bets and board and len(hands) > 1:
+            share = self._rate(c, "bets", "moves", 0.35, 12) ** self.bets
+            bluff = max(0.2, self._rate(c, "air", "shown", 0.25, 6)) ** self.bets
+            hands.sort(key=lambda h: _score([h[0], h[1]] + board), reverse=True)
+            keep = max(1, int(len(hands) * share))
+            hands = hands[:keep] + [h for h in hands[keep:] if rng.random() < bluff]
         missing = 5 - len(board)
-        ranges = [self._candidates(gs, p, unseen, board)
-                  for p in gs.players_in_hand if p != self.player_id]
-        extra = missing + 2 * len(ranges)
         won = counted = 0.0
-        for _ in range(SAMPLES):
-            holes = [r[int(rng.random() * len(r))] for r in ranges]
-            taken = [c for pair in holes for c in pair]
-            if len(set(taken)) != len(taken):
-                continue
-            full_board = board + [c for c in rng.sample(unseen, extra) if c not in taken][:missing]
-            mine = _score(hand + full_board)
-            best, ties = True, 1
-            for a, b in holes:
-                theirs = _score([a, b] + full_board)
-                if theirs > mine:
-                    best = False
-                    break
-                if theirs == mine:
-                    ties += 1
+        for _ in range(samples):
+            pair = hands[int(rng.random() * len(hands))]
+            extra = [x for x in rng.sample(unseen, missing + 2) if x not in pair][:missing]
+            full = board + extra
+            mine, theirs = _score(hand + full), _score(list(pair) + full)
             counted += 1
-            if best:
-                won += 1.0 / ties
-        return won / counted if counted else 0.5
+            won += 1.0 if mine > theirs else 0.5 if mine == theirs else 0.0
+        return won / counted
+
+    def _rival(self, gs):
+        return next(gs.teams[p] for p in range(gs.num_players) if p != self.player_id)
+
+    def _effective(self, gs):
+        me = self.player_id
+        return min(gs.stacks[me] + gs.bets[me],
+                   max(gs.stacks[p] + gs.bets[p] for p in gs.players_in_hand if p != me))
+
+    # ---- moves -------------------------------------------------------------
+
+    def _call(self):
+        return PlayerAction.call(self.player_id)
+
+    def _fold(self, gs):
+        return self._call() if gs.call_amount == 0 else PlayerAction.fold(self.player_id)
+
+    def _raise(self, gs, total):
+        if not gs.can_raise:
+            return self._call()
+        low, high = gs.raise_range
+        return PlayerAction.raise_to(self.player_id, min(high, max(low, int(total))))
+
+    def _bet(self, gs, fraction):
+        return self._raise(gs, gs.current_bet + fraction * (gs.pot + gs.call_amount))
+
+    def _preflop(self, gs):
+        a, b = [_to_int(c) for c in self.hand]
+        pct = _percentile(a, b)
+        bb, r = gs.big_blind, self.rng.random()
+        c = self._counters(self._rival(gs))
+        depth = self._effective(gs) / bb
+        folds = self._rate(c, "pre_folds", "vs_raise", 0.3, 6)
+        reraises = self._rate(c, "reraises", "vs_raise", 0.15, 6)
+
+        if gs.current_bet <= bb:
+            if gs.button == self.player_id:  # first in: raise or fold, never limp
+                if depth <= 10:
+                    return self._raise(gs, gs.max_raise_to) if pct < 0.6 else self._fold(gs)
+                limit = 0.85 if reraises < 0.2 else 0.7 if reraises < 0.35 else 0.55
+                if folds > 0.6:
+                    limit = 1.0
+                return self._raise(gs, 2.5 * bb) if pct <= limit else self._fold(gs)
+            return self._raise(gs, 3.5 * bb) if pct < 0.3 else self._call()  # they limped
+
+        equity = self._equity(gs, 400)
+        odds = gs.pot_odds
+        shoved = gs.call_amount >= gs.stacks[self.player_id] or not gs.can_raise
+        if shoved:
+            return self._call() if equity > odds else self._fold(gs)
+        opened = gs.current_bet <= 4 * bb
+        if opened:  # they opened: re-raise, defend or fold
+            if pct < 0.1 or (0.3 < pct < 0.42 and folds > 0.45 and r < 0.35):
+                return self._raise(gs, gs.max_raise_to if depth <= 15 else 3 * gs.current_bet)
+            return self._call() if equity * 0.85 > odds else self._fold(gs)
+        # They re-raised us: get it in, call or let it go.
+        if equity > 0.58:
+            return self._raise(gs, gs.max_raise_to)
+        return self._call() if equity * 0.9 > odds else self._fold(gs)
+
+    def _value_size(self, gs):
+        """The share of the pot that gets the stacks in by the river."""
+        streets = {"flop": 3, "turn": 2, "river": 1}[gs.street]
+        behind = self._effective(gs) - gs.current_bet
+        ratio = behind / max(1, gs.pot + gs.call_amount)
+        return max(0.33, min(1.0, ((1 + 2 * ratio) ** (1 / streets) - 1) / 2))
+
+    def _postflop(self, gs):
+        c = self._counters(self._rival(gs))
+        equity = self._equity(gs)
+        r = self.rng.random()
+        folds = self._rate(c, "post_folds", "vs_bet", 0.42, 10)
+        pot = gs.pot
+
+        if gs.call_amount == 0:
+            if equity > 0.62:
+                return self._bet(gs, self._value_size(gs))
+            if equity > 0.54 and r < 0.7:
+                return self._bet(gs, 0.4)
+            if gs.street == "flop" and self.raised_last and r < 0.3 + folds:
+                return self._bet(gs, 0.33)  # small and often
+            if gs.street == "turn" and self.raised_last and equity > 0.38 and r < folds:
+                return self._bet(gs, 0.55)
+            if gs.street == "river" and equity < 0.3 and folds > 0.4 and r < folds - 0.15:
+                return self._bet(gs, 0.75)
+            return self._call()
+
+        odds = gs.pot_odds
+        if equity > 0.8:
+            return self._bet(gs, self._value_size(gs) * 1.5)
+        if gs.street == "flop" and 0.42 < equity < 0.58 and folds > 0.45 and r < 0.12:
+            return self._bet(gs, 1.0)  # a semi-bluff raise
+        # The floor: facing a frequent bettor, call a little lighter than the price.
+        often = self._rate(c, "bets", "moves", 0.35, 12) > 0.45
+        needed = odds - (0.05 if often else 0.0) + (0.03 if gs.street != "river" else 0.0)
+        return self._call() if equity > needed else self._fold(gs)
